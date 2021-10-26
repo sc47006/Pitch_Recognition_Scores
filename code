@@ -1,0 +1,246 @@
+#load all packages
+library(devtools)
+library(dplyr)
+library(tidyverse)
+library(baseballr)
+library(tigerstats)
+library(ggplot2)
+library(mgcv)
+library(CalledStrike)
+
+#load in statcast pitch by pitch data from 2017-2019
+statcastall_batters <- read.csv("C:\\Users\\sc470\\Documents\\2017_2019_statcast_scrape\\statcastall_batters.csv")
+
+#create data frame with only middle/middle FB
+zone_5_FB <- statcastall_batters %>% filter(zone == 5 & pitch_type == "FF" | zone == 5 & pitch_type == "SI" | zone == 5 & pitch_type == "FC" | zone == 5 & pitch_type == "FT")
+
+#label counts as pitcher/hitter/first pitch
+zone_5_FB$count_type <- ifelse(zone_5_FB$balls == 0 & zone_5_FB$strikes == 0, "First Pitch", ifelse(zone_5_FB$balls <= zone_5_FB$strikes, "Pitcher's Count", "Hitter's Count"))
+statcastall_batters$count_type <- ifelse(statcastall_batters$balls == 0 & statcastall_batters$strikes == 0, "First Pitch", ifelse(statcastall_batters$balls <= statcastall_batters$strikes, "Pitcher's Count", "Hitter's Count"))
+
+#create a swing counter to track swing rates
+zone_5_FB$swing_count <- ifelse(zone_5_FB$description == "called_strike"|zone_5_FB$description == "ball", 0, 1)
+
+#create a data frame with swing rates on middle/middle FB by batter, count, and year
+swing_rates_z5FB <- zone_5_FB %>% group_by(batter, game_year, count_type) %>% summarize(sum(swing_count), n()) %>%
+  rename("swings" = 'sum(swing_count)') %>% rename("total_pitches" = 'n()')
+
+swing_rates_z5FB$swing_rate <- swing_rates_z5FB$swings/swing_rates_z5FB$total_pitches
+
+#calculate confidence thresholds
+swing_rates_z5FB$confidence_threshold <- qnorm(1-swing_rates_z5FB$swing_rate, mean = 0.92, sd = 0.07)
+
+#calculate frequency of count type
+count_type_frequency <- statcastall_batters %>% group_by(count_type) %>% summarize(n()) %>%
+  rename("pitch_count" = 'n()')
+
+count_type_frequency$pitch_percent <- count_type_frequency$pitch_count/sum(count_type_frequency$pitch_count)
+
+#create a column with count frequencies in the z5B swing rates df
+swing_rates_z5FB$count_type_percent <- count_type_frequency[match(swing_rates_z5FB$count_type, count_type_frequency$count_type), 3]
+
+#create a column that adds up to the aggressiveness score for each batter
+swing_rates_z5FB$adjusted_confidence_threshold <- swing_rates_z5FB$confidence_threshold * swing_rates_z5FB$count_type_percent
+
+#filter data so that only hitters who saw at least 10 middle/middle FB with swing rates < 100% in each count group are included
+filtered_swing_rates_z5FB <- swing_rates_z5FB %>% filter(swing_rate < 1 & total_pitches >= 10)
+
+#need a way to make sure all 3 count types are represented for each hitter/yr combo in filtered_swing_rates_z5FB
+filtered_swing_rates_z5FB_batter_yr_count <- filtered_swing_rates_z5FB %>% count(batter, game_year)
+use_swing_rates_z5FB <- merge(filtered_swing_rates_z5FB, filtered_swing_rates_z5FB_batter_yr_count, by = c('batter', 'game_year'))
+use_swing_rates_z5FB <- use_swing_rates_z5FB %>% rename("count" = "n")
+
+#create a new table with aggregated confidence thresholds scores weighted by count type and grouped by batter and year
+aggressiveness_scores <- use_swing_rates_z5FB %>% group_by(batter, game_year) %>% filter(count == 3) %>% summarize(sum(adjusted_confidence_threshold))
+
+aggressiveness_scores <- rename(aggressiveness_scores, adjusted_confidence_threshold = 'sum(adjusted_confidence_threshold)')
+
+#create aggressiveness scores based on adjusted confidence thresholds so that average is 100, 150 is 50% more aggressive than average...adjusted confidence threshold is even across all 3 seasons of data (0.851), so no yearly adjustment is needed
+aggressiveness_scores$aggressiveness_score <- ((mean(aggressiveness_scores$adjusted_confidence_threshold) - aggressiveness_scores$adjusted_confidence_threshold))/mean(aggressiveness_scores$adjusted_confidence_threshold)*100 + 100
+
+#check year to year stickiness of aggressiveness scores overall and by count type
+aggressiveness_scores$current_yr_id <- paste(aggressiveness_scores$batter, aggressiveness_scores$game_year)
+aggressiveness_scores$next_yr_id <- paste(aggressiveness_scores$batter, aggressiveness_scores$game_year + 1)
+
+aggressiveness_scores$next_yr_aggressiveness_score <- aggressiveness_scores[match(aggressiveness_scores$next_yr_id, aggressiveness_scores$current_yr_id), 4]
+aggressiveness_scores$next_yr_aggressiveness_score <- as.numeric(unlist(aggressiveness_scores$next_yr_aggressiveness_score))
+
+#graph aggressiveness score year to year stickiness for the overall aggressiveness scores and aggressiveness scores by count type
+aggressiveness_score_stickiness_overall <- ggplot(aggressiveness_scores, aes(x = aggressiveness_score, y = next_yr_aggressiveness_score)) + geom_point() + geom_smooth(method = "lm", se = FALSE)
+
+#need to get means by count to make aggressiveness scores by count type; 100 should by average for each count type
+avg_confidence_thresholds_by_count_type <- use_swing_rates_z5FB %>% filter(count == 3) %>% group_by(count_type) %>% summarize(mean(confidence_threshold))
+use_swing_rates_z5FB$avg_confidence_threshold <- avg_confidence_thresholds_by_count_type[match(use_swing_rates_z5FB$count_type, avg_confidence_thresholds_by_count_type$count_type), 2]
+use_swing_rates_z5FB$aggressiveness_score <- ((use_swing_rates_z5FB$avg_confidence_threshold - use_swing_rates_z5FB$confidence_threshold)/use_swing_rates_z5FB$avg_confidence_threshold)*100 + 100
+use_swing_rates_z5FB$aggressiveness_score <- as.numeric(unlist(use_swing_rates_z5FB$aggressiveness_score))
+
+aggressiveness_scores_sample <- use_swing_rates_z5FB %>% filter(count == 3)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#figure out the likelihood of a pitch being called a strike based on location
+#create a df that only has non-swings and counts called strikes
+non_swings <- statcastall_batters %>% filter(description == "blocked_ball" | description == "called_strike" | description == "ball")
+non_swings$called_strike_check <- ifelse(non_swings$description == "called_strike", 1, 0)
+
+#create a gam model that predicts whether or not a pitch is a called strike based on location and batter handedness
+cs_model_df <- non_swings %>% filter(game_date == "2019-04-08" | game_date == "2019-04-10" | game_date == "2019-04-12" | game_date == "2019-04-14" | game_date == "2019-04-16")
+called_strike_model_RHH = gam(called_strike_check ~ s(plate_x, plate_z), family = binomial, data = filter(cs_model_df, stand == "R"))
+called_strike_model_LHH = gam(called_strike_check ~ s(plate_x, plate_z), family = binomial, data = filter(cs_model_df, stand == "L"))
+cs_model_df$called_strike_likelihood <- ifelse(cs_model_df$stand == "R", predict.gam(called_strike_model_RHH, cs_model_df, type = "response"), predict.gam(called_strike_model_LHH, cs_model_df, type = "response"))
+#for sample knowledge reasons want to know how many samples we have per attack zone
+attack_zone_model_sample_count <- cs_model_df %>% group_by(attack_zone) %>% summarize(n())
+
+
+
+#define attack zones 
+non_swings$zone_size <- non_swings$sz_top - non_swings$sz_bot
+
+non_swings$attack_zone <-   non_swings$attack_zone <-  ifelse(non_swings$plate_x>-0.55833 & non_swings$plate_x<=-0.275 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(1/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/6)), 1,
+                                                              ifelse(non_swings$plate_x>-0.275 & non_swings$plate_x<=0.275 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(1/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/6)), 2,
+                                                                     ifelse(non_swings$plate_x>0.275 & non_swings$plate_x<=0.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(1/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/6)), 3,
+                                                                            ifelse(non_swings$plate_x>-0.55833 & non_swings$plate_x<=-0.275 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(2/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/3)), 4,
+                                                                                   ifelse(non_swings$plate_x>-0.275 & non_swings$plate_x<=0.275 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(2/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/3)), 5,
+                                                                                          ifelse(non_swings$plate_x>0.275 & non_swings$plate_x<=.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(2/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/3)), 6,
+                                                                                                 ifelse(non_swings$plate_x>-0.55833 & non_swings$plate_x<=-0.275 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(5/6)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(2/3)), 7,
+                                                                                                        ifelse(non_swings$plate_x>-0.275 & non_swings$plate_x<=0.275 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(5/6)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(2/3)), 8,
+                                                                                                               ifelse(non_swings$plate_x>0.275 & non_swings$plate_x<=0.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(5/6)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(2/3)), 9,
+                                                                                                                      ifelse(non_swings$plate_x>-1.10833 & non_swings$plate_x<=-0.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(1/6)) & non_swings$plate_z<=non_swings$sz_top + (non_swings$zone_size*(1/3)), 11,
+                                                                                                                             ifelse(non_swings$plate_x>-0.55833 & non_swings$plate_x<=0.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(1/6)) & non_swings$plate_z<=non_swings$sz_top + (non_swings$zone_size*(1/6)), 12,
+                                                                                                                                    ifelse(non_swings$plate_x>0.55833 & non_swings$plate_x<=1.108333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(1/6)) & non_swings$plate_z<=non_swings$sz_top + (non_swings$zone_size*(1/6)), 13,
+                                                                                                                                           ifelse(non_swings$plate_x>-1.10833 & non_swings$plate_x<=-0.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(2/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/3)), 14,
+                                                                                                                                                  ifelse(non_swings$plate_x>0.558333 & non_swings$plate_x<=1.108333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(2/3)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(1/3)), 16,
+                                                                                                                                                         ifelse(non_swings$plate_x>-1.108333 & non_swings$plate_x<=-0.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(7/6)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(5/6)), 17,
+                                                                                                                                                                ifelse(non_swings$plate_x>-0.558333 & non_swings$plate_x<=0.558333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(7/6)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(5/6)), 18,
+                                                                                                                                                                       ifelse(non_swings$plate_x>0.558333 & non_swings$plate_x<=1.108333 & non_swings$plate_z>non_swings$sz_top - (non_swings$zone_size*(7/6)) & non_swings$plate_z<=non_swings$sz_top - (non_swings$zone_size*(5/6)), 19,
+                                                                                                                                                                              ifelse(non_swings$plate_x < -0.55833 & non_swings$plate_x >= -1.66667 & non_swings$plate_z > non_swings$sz_top + (non_swings$zone_size*(1/3)) & non_swings$plate_z <= non_swings$sz_top + (non_swings$zone_size*(2/3)) | non_swings$plate_x < -1.108333 & non_swings$plate_x >= -1.66667 & non_swings$plate_z > non_swings$sz_top - (non_swings$zone_size*(1/6)) & non_swings$plate_z <= non_swings$sz_top + (non_swings$zone_size*(1/3)), 21,
+                                                                                                                                                                                     ifelse(non_swings$plate_x < -0.55833 &  non_swings$plate_x<=0.558333 & non_swings$plate_z > non_swings$sz_top + (non_swings$zone_size*(1/3)) & non_swings$plate_z <= non_swings$sz_top + (non_swings$zone_size*(2/3)), 22, 
+                                                                                                                                                                                            ifelse(non_swings$plate_x > 0.55833 & non_swings$plate_x <= 1.66667 & non_swings$plate_z > non_swings$sz_top + (non_swings$zone_size*(1/3)) & non_swings$plate_z <= non_swings$sz_top + (non_swings$zone_size*(2/3)) | non_swings$plate_x > 1.108333 & non_swings$plate_x <= 1.66667 & non_swings$plate_z > non_swings$sz_top - (non_swings$zone_size*(1/6)) & non_swings$plate_z <= non_swings$sz_top + (non_swings$zone_size*(1/3)), 23,
+                                                                                                                                                                                                   ifelse(non_swings$plate_x < -1.108333 & non_swings$plate_x >= -1.66667 & non_swings$plate_z > non_swings$sz_top - (non_swings$zone_size*(2/3)) & non_swings$plate_z <= non_swings$sz_top - (non_swings$zone_size*(1/3)), 24, 
+                                                                                                                                                                                                          ifelse(non_swings$plate_x > 1.108333 & non_swings$plate_x <= 1.66667 & non_swings$plate_z > non_swings$sz_top - (non_swings$zone_size*(2/3)) & non_swings$plate_z <= non_swings$sz_top - (non_swings$zone_size*(1/3)), 26,
+                                                                                                                                                                                                                 ifelse(non_swings$plate_x < -0.55833 & non_swings$plate_x >= -1.66667 & non_swings$plate_z < non_swings$sz_bot - (non_swings$zone_size*(1/3)) & non_swings$plate_z >= non_swings$sz_bot - (non_swings$zone_size*(2/3)) | non_swings$plate_x < -1.108333 & non_swings$plate_x >= -1.66667 & non_swings$plate_z < non_swings$sz_bot + (non_swings$zone_size*(1/6)) & non_swings$plate_z >= non_swings$sz_bot - (non_swings$zone_size*(2/3)), 27,
+                                                                                                                                                                                                                        ifelse(non_swings$plate_x < -0.55833 &  non_swings$plate_x<=0.558333 & non_swings$plate_z < non_swings$sz_bot - (non_swings$zone_size*(1/3)) & non_swings$plate_z >= non_swings$sz_bot - (non_swings$zone_size*(2/3)), 28,
+                                                                                                                                                                                                                               ifelse(non_swings$plate_x > 0.55833 & non_swings$plate_x <= 1.66667 & non_swings$plate_z < non_swings$sz_bot - (non_swings$zone_size*(1/3)) & non_swings$plate_z >= non_swings$sz_bot - (non_swings$zone_size*(2/3)) | non_swings$plate_x > 1.108333 & non_swings$plate_x <= 1.66667 & non_swings$plate_z < non_swings$sz_bot + (non_swings$zone_size*(1/6)) & non_swings$plate_z >= non_swings$sz_bot - (non_swings$zone_size*(2/3)), 29,
+                                                                                                                                                                                                                                      0)))))))))))))))))))))))))
+
+
+called_strike_rate_by_attack_zone <- non_swings %>% group_by(attack_zone) %>% summarize(mean(called_strike_check))
+non_swings$called_strike_likelihood <- called_strike_rate_by_attack_zone[match(non_swings$attack_zone, called_strike_rate_by_attack_zone$attack_zone), 2]
+called_strike_rate_az_graph <- non_swings %>% ggplot(aes(x = plate_x, y = plate_z, z = called_strike_check)) + geom_contour_filled()
+
+#get a df of swing rates by attack zone for hitters in the aggressiveness scores df
+statcastall_batters$zone_size <- statcastall_batters$sz_top - statcastall_batters$sz_bot
+
+statcastall_batters$attack_zone <-  ifelse(statcastall_batters$plate_x>-0.55833 & statcastall_batters$plate_x<=-0.275 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)), 1,
+                                           ifelse(statcastall_batters$plate_x>-0.275 & statcastall_batters$plate_x<=0.275 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)), 2,
+                                                  ifelse(statcastall_batters$plate_x>0.275 & statcastall_batters$plate_x<=0.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)), 3,
+                                                         ifelse(statcastall_batters$plate_x>-0.55833 & statcastall_batters$plate_x<=-0.275 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)), 4,
+                                                                ifelse(statcastall_batters$plate_x>-0.275 & statcastall_batters$plate_x<=0.275 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)), 5,
+                                                                       ifelse(statcastall_batters$plate_x>0.275 & statcastall_batters$plate_x<=.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)), 6,
+                                                                              ifelse(statcastall_batters$plate_x>-0.55833 & statcastall_batters$plate_x<=-0.275 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(5/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)), 7,
+                                                                                     ifelse(statcastall_batters$plate_x>-0.275 & statcastall_batters$plate_x<=0.275 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(5/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)), 8,
+                                                                                            ifelse(statcastall_batters$plate_x>0.275 & statcastall_batters$plate_x<=0.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(5/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)), 9,
+                                                                                                   ifelse(statcastall_batters$plate_x>-1.10833 & statcastall_batters$plate_x<=-0.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/3)), 11,
+                                                                                                          ifelse(statcastall_batters$plate_x>-0.55833 & statcastall_batters$plate_x<=0.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/6)), 12,
+                                                                                                                 ifelse(statcastall_batters$plate_x>0.55833 & statcastall_batters$plate_x<=1.108333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/6)), 13,
+                                                                                                                        ifelse(statcastall_batters$plate_x>-1.10833 & statcastall_batters$plate_x<=-0.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)), 14,
+                                                                                                                               ifelse(statcastall_batters$plate_x>0.558333 & statcastall_batters$plate_x<=1.108333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)), 16,
+                                                                                                                                      ifelse(statcastall_batters$plate_x>-1.108333 & statcastall_batters$plate_x<=-0.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(7/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(5/6)), 17,
+                                                                                                                                             ifelse(statcastall_batters$plate_x>-0.558333 & statcastall_batters$plate_x<=0.558333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(7/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(5/6)), 18,
+                                                                                                                                                    ifelse(statcastall_batters$plate_x>0.558333 & statcastall_batters$plate_x<=1.108333 & statcastall_batters$plate_z>statcastall_batters$sz_top - (statcastall_batters$zone_size*(7/6)) & statcastall_batters$plate_z<=statcastall_batters$sz_top - (statcastall_batters$zone_size*(5/6)), 19,
+                                                                                                                                                           ifelse(statcastall_batters$plate_x < -0.55833 & statcastall_batters$plate_x >= -1.66667 & statcastall_batters$plate_z > statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z <= statcastall_batters$sz_top + (statcastall_batters$zone_size*(2/3)) | statcastall_batters$plate_x < -1.108333 & statcastall_batters$plate_x >= -1.66667 & statcastall_batters$plate_z > statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)) & statcastall_batters$plate_z <= statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/3)), 21,
+                                                                                                                                                                  ifelse(statcastall_batters$plate_x < -0.55833 &  statcastall_batters$plate_x<=0.558333 & statcastall_batters$plate_z > statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z <= statcastall_batters$sz_top + (statcastall_batters$zone_size*(2/3)), 22, 
+                                                                                                                                                                         ifelse(statcastall_batters$plate_x > 0.55833 & statcastall_batters$plate_x <= 1.66667 & statcastall_batters$plate_z > statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z <= statcastall_batters$sz_top + (statcastall_batters$zone_size*(2/3)) | statcastall_batters$plate_x > 1.108333 & statcastall_batters$plate_x <= 1.66667 & statcastall_batters$plate_z > statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/6)) & statcastall_batters$plate_z <= statcastall_batters$sz_top + (statcastall_batters$zone_size*(1/3)), 23,
+                                                                                                                                                                                ifelse(statcastall_batters$plate_x < -1.108333 & statcastall_batters$plate_x >= -1.66667 & statcastall_batters$plate_z > statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)) & statcastall_batters$plate_z <= statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)), 24, 
+                                                                                                                                                                                       ifelse(statcastall_batters$plate_x > 1.108333 & statcastall_batters$plate_x <= 1.66667 & statcastall_batters$plate_z > statcastall_batters$sz_top - (statcastall_batters$zone_size*(2/3)) & statcastall_batters$plate_z <= statcastall_batters$sz_top - (statcastall_batters$zone_size*(1/3)), 26,
+                                                                                                                                                                                              ifelse(statcastall_batters$plate_x < -0.55833 & statcastall_batters$plate_x >= -1.66667 & statcastall_batters$plate_z < statcastall_batters$sz_bot - (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z >= statcastall_batters$sz_bot - (statcastall_batters$zone_size*(2/3)) | statcastall_batters$plate_x < -1.108333 & statcastall_batters$plate_x >= -1.66667 & statcastall_batters$plate_z < statcastall_batters$sz_bot + (statcastall_batters$zone_size*(1/6)) & statcastall_batters$plate_z >= statcastall_batters$sz_bot - (statcastall_batters$zone_size*(2/3)), 27,
+                                                                                                                                                                                                     ifelse(statcastall_batters$plate_x < -0.55833 &  statcastall_batters$plate_x<=0.558333 & statcastall_batters$plate_z < statcastall_batters$sz_bot - (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z >= statcastall_batters$sz_bot - (statcastall_batters$zone_size*(2/3)), 28,
+                                                                                                                                                                                                            ifelse(statcastall_batters$plate_x > 0.55833 & statcastall_batters$plate_x <= 1.66667 & statcastall_batters$plate_z < statcastall_batters$sz_bot - (statcastall_batters$zone_size*(1/3)) & statcastall_batters$plate_z >= statcastall_batters$sz_bot - (statcastall_batters$zone_size*(2/3)) | statcastall_batters$plate_x > 1.108333 & statcastall_batters$plate_x <= 1.66667 & statcastall_batters$plate_z < statcastall_batters$sz_bot + (statcastall_batters$zone_size*(1/6)) & statcastall_batters$plate_z >= statcastall_batters$sz_bot - (statcastall_batters$zone_size*(2/3)), 29,
+                                                                                                                                                                                                                   0)))))))))))))))))))))))))
+
+
+statcastall_batters$swing_check <- ifelse(statcastall_batters$description == "called_strike" | statcastall_batters$description == "blocked_ball" | statcastall_batters$description == "ball", 0, 1)
+
+statcastall_batters$bt_yr_id <- paste(statcastall_batters$batter, statcastall_batters$game_year)
+
+statcastall_batters$batter_aggressiveness_score <- aggressiveness_scores[match(statcastall_batters$bt_yr_id, aggressiveness_scores$current_yr_id), 4]
+
+statcastall_batters$batter_aggressiveness_score <- as.numeric(unlist(statcastall_batters$batter_aggressiveness_score))
+
+swing_rates_by_az <- statcastall_batters %>% filter(batter_aggressiveness_score > 0 & attack_zone > 0) %>% group_by(batter, game_year, attack_zone, count_type) %>% summarize(mean(swing_check))
+
+#need to pull called strike likelihood by attack zone and confidence thresholds for the batter/yr/count type, then use those to calculate each hitter's projected strike likelihood and compare it to the "actual" number (how often in the attack zone a pitch has a called strike likelihood above the confidence threshold) based on attack zone
+swing_rates_by_az$called_strike_likelihood <- called_strike_rate_by_attack_zone[match(swing_rates_by_az$attack_zone, called_strike_rate_by_attack_zone$attack_zone), 2] 
+swing_rates_by_az$called_strike_likelihood <- as.numeric(unlist(swing_rates_by_az$called_strike_likelihood))
+
+swing_rates_by_az$az_id <- paste(swing_rates_by_az$batter, swing_rates_by_az$count_type, swing_rates_by_az$game_year)
+swing_rates_by_az$confidence_threshold <- aggressiveness_scores_sample[match(swing_rates_by_az$az_id, aggressiveness_scores_sample$current_yr_id), 7]
+
+#need to find what % of pitches in a given attack zone are higher than the hitter's confidence threshold for each count type/attack zone
+cs_model_df$zone_size <- cs_model_df$sz_top - cs_model_df$sz_bot
+
+cs_model_df$attack_zone <-  ifelse(cs_model_df$plate_x>-0.55833 & cs_model_df$plate_x<=-0.275 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)), 1,
+                                   ifelse(cs_model_df$plate_x>-0.275 & cs_model_df$plate_x<=0.275 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)), 2,
+                                          ifelse(cs_model_df$plate_x>0.275 & cs_model_df$plate_x<=0.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)), 3,
+                                                 ifelse(cs_model_df$plate_x>-0.55833 & cs_model_df$plate_x<=-0.275 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)), 4,
+                                                        ifelse(cs_model_df$plate_x>-0.275 & cs_model_df$plate_x<=0.275 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)), 5,
+                                                               ifelse(cs_model_df$plate_x>0.275 & cs_model_df$plate_x<=.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)), 6,
+                                                                      ifelse(cs_model_df$plate_x>-0.55833 & cs_model_df$plate_x<=-0.275 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(5/6)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)), 7,
+                                                                             ifelse(cs_model_df$plate_x>-0.275 & cs_model_df$plate_x<=0.275 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(5/6)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)), 8,
+                                                                                    ifelse(cs_model_df$plate_x>0.275 & cs_model_df$plate_x<=0.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(5/6)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)), 9,
+                                                                                           ifelse(cs_model_df$plate_x>-1.10833 & cs_model_df$plate_x<=-0.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)) & cs_model_df$plate_z<=cs_model_df$sz_top + (cs_model_df$zone_size*(1/3)), 11,
+                                                                                                  ifelse(cs_model_df$plate_x>-0.55833 & cs_model_df$plate_x<=0.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)) & cs_model_df$plate_z<=cs_model_df$sz_top + (cs_model_df$zone_size*(1/6)), 12,
+                                                                                                         ifelse(cs_model_df$plate_x>0.55833 & cs_model_df$plate_x<=1.108333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)) & cs_model_df$plate_z<=cs_model_df$sz_top + (cs_model_df$zone_size*(1/6)), 13,
+                                                                                                                ifelse(cs_model_df$plate_x>-1.10833 & cs_model_df$plate_x<=-0.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)), 14,
+                                                                                                                       ifelse(cs_model_df$plate_x>0.558333 & cs_model_df$plate_x<=1.108333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)), 16,
+                                                                                                                              ifelse(cs_model_df$plate_x>-1.108333 & cs_model_df$plate_x<=-0.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(7/6)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(5/6)), 17,
+                                                                                                                                     ifelse(cs_model_df$plate_x>-0.558333 & cs_model_df$plate_x<=0.558333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(7/6)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(5/6)), 18,
+                                                                                                                                            ifelse(cs_model_df$plate_x>0.558333 & cs_model_df$plate_x<=1.108333 & cs_model_df$plate_z>cs_model_df$sz_top - (cs_model_df$zone_size*(7/6)) & cs_model_df$plate_z<=cs_model_df$sz_top - (cs_model_df$zone_size*(5/6)), 19,
+                                                                                                                                                   ifelse(cs_model_df$plate_x < -0.55833 & cs_model_df$plate_x >= -1.66667 & cs_model_df$plate_z > cs_model_df$sz_top + (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z <= cs_model_df$sz_top + (cs_model_df$zone_size*(2/3)) | cs_model_df$plate_x < -1.108333 & cs_model_df$plate_x >= -1.66667 & cs_model_df$plate_z > cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)) & cs_model_df$plate_z <= cs_model_df$sz_top + (cs_model_df$zone_size*(1/3)), 21,
+                                                                                                                                                          ifelse(cs_model_df$plate_x < -0.55833 &  cs_model_df$plate_x<=0.558333 & cs_model_df$plate_z > cs_model_df$sz_top + (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z <= cs_model_df$sz_top + (cs_model_df$zone_size*(2/3)), 22, 
+                                                                                                                                                                 ifelse(cs_model_df$plate_x > 0.55833 & cs_model_df$plate_x <= 1.66667 & cs_model_df$plate_z > cs_model_df$sz_top + (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z <= cs_model_df$sz_top + (cs_model_df$zone_size*(2/3)) | cs_model_df$plate_x > 1.108333 & cs_model_df$plate_x <= 1.66667 & cs_model_df$plate_z > cs_model_df$sz_top - (cs_model_df$zone_size*(1/6)) & cs_model_df$plate_z <= cs_model_df$sz_top + (cs_model_df$zone_size*(1/3)), 23,
+                                                                                                                                                                        ifelse(cs_model_df$plate_x < -1.108333 & cs_model_df$plate_x >= -1.66667 & cs_model_df$plate_z > cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)) & cs_model_df$plate_z <= cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)), 24, 
+                                                                                                                                                                               ifelse(cs_model_df$plate_x > 1.108333 & cs_model_df$plate_x <= 1.66667 & cs_model_df$plate_z > cs_model_df$sz_top - (cs_model_df$zone_size*(2/3)) & cs_model_df$plate_z <= cs_model_df$sz_top - (cs_model_df$zone_size*(1/3)), 26,
+                                                                                                                                                                                      ifelse(cs_model_df$plate_x < -0.55833 & cs_model_df$plate_x >= -1.66667 & cs_model_df$plate_z < cs_model_df$sz_bot - (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z >= cs_model_df$sz_bot - (cs_model_df$zone_size*(2/3)) | cs_model_df$plate_x < -1.108333 & cs_model_df$plate_x >= -1.66667 & cs_model_df$plate_z < cs_model_df$sz_bot + (cs_model_df$zone_size*(1/6)) & cs_model_df$plate_z >= cs_model_df$sz_bot - (cs_model_df$zone_size*(2/3)), 27,
+                                                                                                                                                                                             ifelse(cs_model_df$plate_x < -0.55833 &  cs_model_df$plate_x<=0.558333 & cs_model_df$plate_z < cs_model_df$sz_bot - (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z >= cs_model_df$sz_bot - (cs_model_df$zone_size*(2/3)), 28,
+                                                                                                                                                                                                    ifelse(cs_model_df$plate_x > 0.55833 & cs_model_df$plate_x <= 1.66667 & cs_model_df$plate_z < cs_model_df$sz_bot - (cs_model_df$zone_size*(1/3)) & cs_model_df$plate_z >= cs_model_df$sz_bot - (cs_model_df$zone_size*(2/3)) | cs_model_df$plate_x > 1.108333 & cs_model_df$plate_x <= 1.66667 & cs_model_df$plate_z < cs_model_df$sz_bot + (cs_model_df$zone_size*(1/6)) & cs_model_df$plate_z >= cs_model_df$sz_bot - (cs_model_df$zone_size*(2/3)), 29,
+                                                                                                                                                                                                           0)))))))))))))))))))))))))
+
+
+
+
+
+#Did some COUNTIFS in Excel to count how often pitches in a given attack zone were higher than the hitter's confidence threshold (their implied swing rate)
+write.csv(cs_model_df,"C:\\Users\\sc470\\Documents\\PSL_2\\cs_model_df.csv", row.names = FALSE)
+write.csv(swing_rates_by_az,"C:\\Users\\sc470\\Documents\\PSL_2\\swing_rates_by_az.csv", row.names = FALSE)
+
+#now need to load it back in, then figure out actual swing rates by attack zone and how to weight each attack zone by pitch frequency to get the overall PRS scores
+swing_rates_by_az <- read.csv("C:\\Users\\sc470\\Documents\\PSL_2\\swing_rates_by_az_implied_swing_rates_inc.csv")
+
+#calculate the gap between actual swing rate and implied swing rate
+swing_rates_by_az$swing_rate_gap <- abs(swing_rates_by_az$mean.swing_check. - swing_rates_by_az$implied_swing_rate)
+
+
+#weight swing rate gaps by attack zone frequency
+attack_zone_frequency <- statcastall_batters %>% group_by(attack_zone) %>% summarize(n())
+#(statcastall_batters %>% filter(attack_zone > 0) %>% summarise(n())) = 1540778
+attack_zone_frequency$percent <- attack_zone_frequency$`n()`/1540778
+swing_rates_by_az$az_weight <- attack_zone_frequency[match(swing_rates_by_az$attack_zone, attack_zone_frequency$attack_zone), 3]
+swing_rates_by_az$weighted_swing_rate_gap <- swing_rates_by_az$swing_rate_gap * swing_rates_by_az$az_weight
+
+#now just add up the weighted swing rate gaps and group by player and year and that's about it
+PRS_scores <- swing_rates_by_az %>% group_by(batter, game_year) %>% summarize(sum(weighted_swing_rate_gap)) %>%
+  rename("PRS_score" = `sum(weighted_swing_rate_gap)`)
+
+#finished up in Excel: https://docs.google.com/spreadsheets/d/1dgGJnAxKysZ0rTLmZJNwyzXuhWW-r2kZ/edit?usp=sharing&ouid=115079658784392150536&rtpof=true&sd=true
